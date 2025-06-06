@@ -19,7 +19,8 @@ pthread_t input_thread;
 void timer_handler(int sig, siginfo_t *si, void *uc) {
     pthread_mutex_lock(&mutex);
     if (pending_event) {
-        printf("Processed key: %c at %s", latest_key, ctime(&time(NULL)));
+        time_t now = time(NULL); // Store the current time in a variable
+        printf("Processed key: %c at %s", latest_key, ctime(&now));
         pending_event = 0;
     }
     pthread_mutex_unlock(&mutex);
