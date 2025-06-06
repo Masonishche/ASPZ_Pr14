@@ -98,7 +98,6 @@ int main() {
             }
         }
 
-        usleep(10000); // Sleep 10 ms to reduce CPU usage
     }
 
     timer_delete(debounce_timer);
