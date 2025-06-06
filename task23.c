@@ -1,99 +1,106 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <signal.h>
 #include <time.h>
-#include <errno.h>
+#include <termios.h>
+#include <fcntl.h>
 
-#define DEBOUNCE_MS 500 // Debounce delay in milliseconds
+#define DEBOUNCE_INTERVAL_MS 300
 
-// Global variables
-volatile int latest_key = 0;
-volatile int pending_event = 0;
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-timer_t timerid;
-pthread_t input_thread;
+volatile sig_atomic_t debounce_flag = 0;
+timer_t debounce_timer;
 
-// Timer handler
-void timer_handler(int sig, siginfo_t *si, void *uc) {
-    pthread_mutex_lock(&mutex);
-    if (pending_event) {
-        time_t now = time(NULL); // Store the current time in a variable
-        printf("Processed key: %c at %s", latest_key, ctime(&now));
-        pending_event = 0;
-    }
-    pthread_mutex_unlock(&mutex);
+// Restore original terminal settings
+struct termios orig_termios;
+
+void reset_terminal_mode() {
+    tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
 }
 
-// Worker thread for keyboard input
-void *input_worker(void *arg) {
-    char key;
-    printf("Enter keys (press Ctrl+C to exit). Debounced after %dms...\n", DEBOUNCE_MS);
-    while (1) {
-        key = getchar();
-        if (key == EOF) break; // Exit on Ctrl+C or EOF
-        pthread_mutex_lock(&mutex);
-        latest_key = key;
-        pending_event = 1;
-        // Reset the timer
-        struct itimerspec its;
-        its.it_value.tv_sec = DEBOUNCE_MS / 1000;
-        its.it_value.tv_nsec = (DEBOUNCE_MS % 1000) * 1000000;
-        its.it_interval.tv_sec = 0;
-        its.it_interval.tv_nsec = 0; // One-shot timer
-        if (timer_settime(timerid, 0, &its, NULL) == -1) {
-            fprintf(stderr, "Failed to reset timer\n");
-            pthread_mutex_unlock(&mutex);
-            break;
-        }
-        pthread_mutex_unlock(&mutex);
-    }
-    return NULL;
+// Set terminal to raw mode for non-blocking key reading
+void set_conio_terminal_mode() {
+    struct termios new_termios;
+    tcgetattr(STDIN_FILENO, &orig_termios);
+    atexit(reset_terminal_mode);
+    new_termios = orig_termios;
+
+    new_termios.c_lflag &= ~(ICANON | ECHO); // Raw input mode
+    tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
+}
+
+// Set stdin to non-blocking mode
+void set_nonblocking_mode() {
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+}
+
+// Timer signal handler
+void timer_handler(int sig) {
+    debounce_flag = 0;
+}
+
+// Start or restart the debounce timer
+void start_debounce_timer() {
+    struct itimerspec ts;
+    ts.it_value.tv_sec = DEBOUNCE_INTERVAL_MS / 1000;
+    ts.it_value.tv_nsec = (DEBOUNCE_INTERVAL_MS % 1000) * 1000000;
+    ts.it_interval.tv_sec = 0;
+    ts.it_interval.tv_nsec = 0;
+
+    timer_settime(debounce_timer, 0, &ts, NULL);
+    debounce_flag = 1;
 }
 
 int main() {
-    struct sigevent sev;
     struct sigaction sa;
+    struct sigevent sev;
 
-    // Set up signal handler for timer
-    sa.sa_flags = SA_SIGINFO;
-    sa.sa_sigaction = timer_handler;
+    printf("Debounce key handler with POSIX timer (FreeBSD)\n");
+    printf("Press keys to test. Press 'q' to quit.\n");
+
+    // Set terminal to raw, non-blocking input mode
+    set_conio_terminal_mode();
+    set_nonblocking_mode();
+
+    // Setup signal handler for timer
+    sa.sa_flags = 0;
+    sa.sa_handler = timer_handler;
     sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGRTMIN, &sa, NULL) == -1) {
-        perror("sigaction");
-        exit(1);
-    }
+    sigaction(SIGRTMIN, &sa, NULL);
 
-    // Block SIGRTMIN in main thread (inherited by input thread)
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGRTMIN);
-    if (pthread_sigmask(SIG_BLOCK, &set, NULL) == -1) {
-        perror("pthread_sigmask");
-        exit(1);
-    }
-
-    // Create the timer
+    // Create POSIX timer
     sev.sigev_notify = SIGEV_SIGNAL;
     sev.sigev_signo = SIGRTMIN;
-    sev.sigev_value.sival_ptr = &timerid;
-    if (timer_create(CLOCK_REALTIME, &sev, &timerid) == -1) {
+    sev.sigev_value.sival_ptr = &debounce_timer;
+
+    if (timer_create(CLOCK_REALTIME, &sev, &debounce_timer) == -1) {
         perror("timer_create");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
-    // Start input worker thread
-    if (pthread_create(&input_thread, NULL, input_worker, NULL) != 0) {
-        perror("pthread_create");
-        exit(1);
+    while (1) {
+        char ch;
+        ssize_t n = read(STDIN_FILENO, &ch, 1);
+
+        if (n > 0) {
+            if (!debounce_flag) {
+                printf("Key pressed: %c\n", ch);
+                start_debounce_timer();
+
+                if (ch == 'q') {
+                    break;
+                }
+            } else {
+                // Debounced key - ignored
+            }
+        }
+
+        usleep(10000); // Sleep 10 ms to reduce CPU usage
     }
 
-    // Wait for input thread to finish
-    pthread_join(input_thread, NULL);
-
-    // Cleanup
-    timer_delete(timerid);
-    printf("Program terminated.\n");
+    timer_delete(debounce_timer);
     return 0;
 }
